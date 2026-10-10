@@ -22,6 +22,7 @@ OLLAMA_URL = os.getenv(
     "OLLAMA_URL", "http://localhost:11434"
 ).rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b").strip()
+OLLAMA_TIMEOUT_SECONDS = 120
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
@@ -348,7 +349,7 @@ def _call_ollama(messages: list[dict[str, str]]) -> str:
     )
 
     try:
-        with urlopen(request, timeout=120) as response:
+        with urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
             api_response = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         logger.error("Ollama returned HTTP status %s", exc.code)
@@ -357,31 +358,61 @@ def _call_ollama(messages: list[dict[str, str]]) -> str:
                 f"Ollama could not find model '{OLLAMA_MODEL}'. "
                 "Pull the model and verify OLLAMA_MODEL."
             ) from exc
+        if exc.code == 400:
+            raise AIServiceError(
+                "Ollama rejected the chat request (HTTP 400). Verify the "
+                "configured model supports the requested JSON schema."
+            ) from exc
+        if exc.code >= 500:
+            raise AIServiceError(
+                f"Ollama is unavailable while handling the chat request "
+                f"(HTTP {exc.code}). Check the local Ollama service."
+            ) from exc
         raise AIServiceError(
             f"Ollama rejected the chat request (HTTP {exc.code})."
         ) from exc
-    except (URLError, TimeoutError, OSError) as exc:
+    except (URLError, TimeoutError) as exc:
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(reason, TimeoutError):
+            logger.warning(
+                "Ollama request timed out after %s seconds",
+                OLLAMA_TIMEOUT_SECONDS,
+            )
+            raise AIServiceError(
+                f"Ollama did not respond within {OLLAMA_TIMEOUT_SECONDS} "
+                "seconds. The model may still be loading; check Ollama and "
+                "retry the analysis."
+            ) from exc
         logger.error("Local AI connection failed: %s", type(exc).__name__)
         raise AIServiceError(
-            "Cannot connect to local Ollama. Ensure the configured service "
-            f"is running and model '{OLLAMA_MODEL}' is available."
+            "Could not connect to local Ollama. Verify OLLAMA_URL and "
+            f"confirm model '{OLLAMA_MODEL}' is available."
+        ) from exc
+    except OSError as exc:
+        logger.error("Ollama transport failed: %s", type(exc).__name__)
+        raise AIServiceError(
+            "The connection to local Ollama was interrupted. Check the "
+            "service and retry the analysis."
         ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logger.error("Ollama returned an invalid API response envelope")
+        logger.error("Ollama returned an invalid JSON response envelope")
         raise AIServiceError(
-            "Ollama returned an invalid response. Check the local service."
+            "Ollama returned invalid JSON instead of a chat response. "
+            "Check the local service and retry."
         ) from exc
 
     if not isinstance(api_response, dict):
         raise AIServiceError(
-            "Ollama /api/chat returned an invalid response envelope."
+            "Ollama /api/chat returned an invalid response envelope. "
+            "Check the local service version and retry."
         )
     message = api_response.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str):
         logger.error("Ollama /api/chat response is missing message.content")
         raise AIServiceError(
-            "Ollama /api/chat response is missing message.content."
+            "Ollama /api/chat response is missing message.content. "
+            "Check the local service version and retry."
         )
     return content
 

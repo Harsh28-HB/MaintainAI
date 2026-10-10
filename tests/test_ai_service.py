@@ -1,5 +1,5 @@
 import json
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -28,6 +28,11 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return self.body
+
+
+class FakeBytesResponse(FakeResponse):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
 
 
 def valid_result() -> dict:
@@ -187,9 +192,116 @@ def test_ollama_connection_failure_is_actionable(monkeypatch):
 
     with pytest.raises(
         ai_service.AIServiceError,
-        match="Cannot connect to local Ollama",
+        match="Could not connect to local Ollama",
     ):
         ai_service.analyze_issue({}, {}, EVIDENCE)
+
+
+def test_ollama_chat_uses_configured_endpoint_schema_and_timeout(monkeypatch):
+    content = json.dumps(valid_result())
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse(content)
+
+    monkeypatch.setattr(ai_service, "OLLAMA_URL", "http://localhost:11434")
+    monkeypatch.setattr(ai_service, "OLLAMA_MODEL", "qwen2.5:3b")
+    monkeypatch.setattr(ai_service, "urlopen", fake_urlopen)
+
+    response = ai_service._call_ollama([
+        {"role": "user", "content": "Analyze this issue."}
+    ])
+
+    assert response == content
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert request.full_url == "http://localhost:11434/api/chat"
+    assert request.get_method() == "POST"
+    assert request.headers["Content-type"] == "application/json"
+    payload = json.loads(request.data)
+    assert payload["model"] == "qwen2.5:3b"
+    assert payload["stream"] is False
+    assert payload["format"] == ai_service.OUTPUT_SCHEMA
+    assert payload["messages"] == [
+        {"role": "user", "content": "Analyze this issue."}
+    ]
+    assert payload["options"] == {"temperature": 0.1}
+    assert timeout == ai_service.OLLAMA_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("request timed out"),
+        URLError(TimeoutError("socket timed out")),
+    ],
+)
+def test_ollama_timeout_has_distinct_actionable_error(monkeypatch, failure):
+    def timed_out(request, timeout):
+        raise failure
+
+    monkeypatch.setattr(ai_service, "urlopen", timed_out)
+
+    with pytest.raises(ai_service.AIServiceError, match="did not respond within"):
+        ai_service._call_ollama([])
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "supports the requested JSON schema"),
+        (404, "could not find model"),
+        (503, "Ollama is unavailable"),
+    ],
+)
+def test_ollama_http_errors_are_classified(monkeypatch, status, message):
+    def rejected(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            status,
+            "Ollama error response",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(ai_service, "urlopen", rejected)
+
+    with pytest.raises(ai_service.AIServiceError, match=message):
+        ai_service._call_ollama([])
+
+
+def test_ollama_invalid_response_json_has_distinct_error(monkeypatch):
+    monkeypatch.setattr(
+        ai_service,
+        "urlopen",
+        lambda request, timeout: FakeBytesResponse(b"{invalid"),
+    )
+
+    with pytest.raises(ai_service.AIServiceError, match="returned invalid JSON"):
+        ai_service._call_ollama([])
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (b"[]", "invalid response envelope"),
+        (b'{"message": {}}', "missing message.content"),
+    ],
+)
+def test_ollama_invalid_response_envelope_is_actionable(
+    monkeypatch,
+    body,
+    message,
+):
+    monkeypatch.setattr(
+        ai_service,
+        "urlopen",
+        lambda request, timeout: FakeBytesResponse(body),
+    )
+
+    with pytest.raises(ai_service.AIServiceError, match=message):
+        ai_service._call_ollama([])
 
 
 def test_ollama_connection_error_does_not_disclose_endpoint_credentials(
@@ -212,3 +324,17 @@ def test_ollama_connection_error_does_not_disclose_endpoint_credentials(
     assert "private-user" not in str(error.value)
     assert "private-password" not in str(error.value)
     assert "example.test" not in str(error.value)
+
+
+def test_ollama_connection_error_does_not_echo_endpoint_host(monkeypatch):
+    monkeypatch.setattr(ai_service, "OLLAMA_URL", "https://sensitive.invalid")
+
+    def unavailable(request, timeout):
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(ai_service, "urlopen", unavailable)
+
+    with pytest.raises(ai_service.AIServiceError) as error:
+        ai_service._call_ollama([])
+
+    assert "sensitive.invalid" not in str(error.value)
