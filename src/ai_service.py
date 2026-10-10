@@ -9,7 +9,17 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from openai import OpenAI
+import streamlit as st
+from openai import (
+    APIError,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    RateLimitError,
+)
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from src.retrieval import format_evidence
 
@@ -17,15 +27,31 @@ load_dotenv()
 
 logger = logging.getLogger("maintainai.ai")
 
-AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").strip().lower()
-OLLAMA_URL = os.getenv(
+
+def _streamlit_secret(name: str) -> str | None:
+    try:
+        value = st.secrets.get(name)
+    except StreamlitSecretNotFoundError:
+        return None
+    return str(value).strip() if value is not None else None
+
+
+def _config_value(name: str, default: str = "") -> str:
+    environment_value = os.getenv(name, "").strip()
+    if environment_value:
+        return environment_value
+    return _streamlit_secret(name) or default
+
+
+AI_PROVIDER = _config_value("AI_PROVIDER", "ollama").lower()
+OLLAMA_URL = _config_value(
     "OLLAMA_URL", "http://localhost:11434"
 ).rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b").strip()
+OLLAMA_MODEL = _config_value("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA_TIMEOUT_SECONDS = 120
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+OPENAI_API_KEY = _config_value("OPENAI_API_KEY")
+OPENAI_MODEL = _config_value("OPENAI_MODEL")
+OPENAI_BASE_URL = _config_value("OPENAI_BASE_URL").rstrip("/")
 
 
 class AIServiceError(Exception):
@@ -436,7 +462,11 @@ def _call_hosted_llm(messages: list[dict[str, str]], provider: str) -> str:
         )
 
     try:
-        client_kwargs = {"api_key": api_key, "timeout": 30.0, "max_retries": 1}
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "timeout": 30.0,
+            "max_retries": 1,
+        }
         if OPENAI_BASE_URL:
             client_kwargs["base_url"] = OPENAI_BASE_URL
         client = OpenAI(**client_kwargs)
@@ -446,12 +476,54 @@ def _call_hosted_llm(messages: list[dict[str, str]], provider: str) -> str:
             response_format={"type": "json_object"},
             messages=messages,
         )
-        content = response.choices[0].message.content
-    except Exception as exc:
-        logger.error("Hosted AI request failed for provider %s: %s", provider, type(exc).__name__)
+    except APITimeoutError as exc:
+        logger.warning("Hosted AI request timed out for provider %s", provider)
         raise AIServiceError(
-            "Hosted AI analysis failed. Check the configured API key, model, and endpoint."
+            "Hosted AI request timed out. Retry the analysis or check provider "
+            "availability."
         ) from exc
+    except AuthenticationError as exc:
+        logger.error("Hosted AI authentication failed for provider %s", provider)
+        raise AIServiceError(
+            "Hosted AI authentication failed. Verify OPENAI_API_KEY in the "
+            "environment or Streamlit secrets."
+        ) from exc
+    except RateLimitError as exc:
+        logger.warning("Hosted AI rate limit reached for provider %s", provider)
+        raise AIServiceError(
+            "Hosted AI rate limit reached. Retry later or check the provider "
+            "quota."
+        ) from exc
+    except APIConnectionError as exc:
+        logger.error("Hosted AI connection failed for provider %s", provider)
+        raise AIServiceError(
+            "Could not connect to the hosted AI provider. Check network access "
+            "and OPENAI_BASE_URL."
+        ) from exc
+    except APIStatusError as exc:
+        logger.error(
+            "Hosted AI provider %s returned HTTP status %s",
+            provider,
+            exc.status_code,
+        )
+        raise AIServiceError(
+            f"Hosted AI provider returned HTTP {exc.status_code}."
+        ) from exc
+    except APIError as exc:
+        logger.error(
+            "Hosted AI SDK error for provider %s: %s",
+            provider,
+            type(exc).__name__,
+        )
+        raise AIServiceError(
+            "Hosted AI request failed. Check provider configuration and retry."
+        ) from exc
+
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise AIServiceError("Hosted AI returned no completion choices.")
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
 
     if not isinstance(content, str) or not content.strip():
         raise AIServiceError("Hosted AI returned an empty response.")
@@ -500,7 +572,8 @@ def analyze_issue(
         provider_model = OPENAI_MODEL
     else:
         raise AIServiceError(
-            "Unsupported AI_PROVIDER value. Use 'ollama' or 'openai'."
+            "Unsupported AI_PROVIDER value. Use 'ollama', 'openai', or "
+            "'openai_compatible'."
         )
 
     for attempt in range(2):

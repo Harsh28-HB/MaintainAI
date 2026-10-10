@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -11,6 +12,28 @@ EVIDENCE = [{
     "citation": CITATION,
     "content": "Check mounting bolts and inspect alignment.",
 }]
+
+
+def test_config_reads_streamlit_secret_when_environment_is_unset(monkeypatch):
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.setattr(
+        ai_service,
+        "_streamlit_secret",
+        lambda name: "cloud-model" if name == "OPENAI_MODEL" else None,
+    )
+
+    assert ai_service._config_value("OPENAI_MODEL") == "cloud-model"
+
+
+def test_environment_config_takes_precedence_over_streamlit_secret(monkeypatch):
+    monkeypatch.setenv("OPENAI_MODEL", "environment-model")
+    monkeypatch.setattr(
+        ai_service,
+        "_streamlit_secret",
+        lambda name: "cloud-model",
+    )
+
+    assert ai_service._config_value("OPENAI_MODEL") == "environment-model"
 
 
 class FakeResponse:
@@ -79,6 +102,120 @@ def run_with_responses(monkeypatch, responses: list[str]):
         EVIDENCE,
     )
     return result, calls
+
+
+@pytest.mark.parametrize("provider", ["openai", "openai_compatible"])
+def test_analyze_issue_selects_hosted_provider_and_validates_output(
+    monkeypatch,
+    provider,
+):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", provider)
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "cloud-model")
+    monkeypatch.setattr(
+        ai_service,
+        "_call_hosted_llm",
+        lambda messages, selected_provider: json.dumps(valid_result()),
+    )
+
+    result = ai_service.analyze_issue({}, {}, EVIDENCE)
+
+    assert result["ai_provider"] == provider
+    assert result["ai_model"] == "cloud-model"
+    assert result["draft_work_order"]["evidence_citations"] == [CITATION]
+    assert result["review_status"] == "draft"
+
+
+def test_hosted_provider_uses_configured_credentials_model_and_endpoint(
+    monkeypatch,
+):
+    client_config = {}
+    request_config = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            client_config.update(kwargs)
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self.create)
+            )
+
+        def create(self, **kwargs):
+            request_config.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"result": "ok"}')
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(ai_service, "OPENAI_API_KEY", "test-secret")
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "cloud-model")
+    monkeypatch.setattr(
+        ai_service,
+        "OPENAI_BASE_URL",
+        "https://provider.example/v1",
+    )
+    monkeypatch.setattr(ai_service, "OpenAI", FakeOpenAI)
+
+    content = ai_service._call_hosted_llm(
+        [{"role": "user", "content": "Analyze."}],
+        "openai_compatible",
+    )
+
+    assert content == '{"result": "ok"}'
+    assert client_config == {
+        "api_key": "test-secret",
+        "timeout": 30.0,
+        "max_retries": 1,
+        "base_url": "https://provider.example/v1",
+    }
+    assert request_config["model"] == "cloud-model"
+    assert request_config["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "error_type", "expected_message"),
+    [
+        ("APITimeoutError", "timeout", "request timed out"),
+        ("AuthenticationError", "authentication", "authentication failed"),
+        ("RateLimitError", "rate_limit", "rate limit reached"),
+        ("APIConnectionError", "connection", "Could not connect"),
+        ("APIStatusError", "status", "HTTP 503"),
+    ],
+)
+def test_hosted_provider_failures_are_actionable_and_sanitized(
+    monkeypatch,
+    exception_name,
+    error_type,
+    expected_message,
+):
+    if error_type == "status":
+        class MockProviderError(Exception):
+            status_code = 503
+    else:
+        class MockProviderError(Exception):
+            pass
+
+    class FailedOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self.create)
+            )
+
+        def create(self, **kwargs):
+            raise MockProviderError("private-secret-value")
+
+    monkeypatch.setattr(ai_service, "OPENAI_API_KEY", "configured-secret")
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "cloud-model")
+    monkeypatch.setattr(ai_service, "OpenAI", FailedOpenAI)
+    monkeypatch.setattr(ai_service, exception_name, MockProviderError)
+
+    with pytest.raises(ai_service.AIServiceError) as error:
+        ai_service._call_hosted_llm([], "openai")
+
+    assert expected_message in str(error.value)
+    assert "private-secret-value" not in str(error.value)
+    assert "configured-secret" not in str(error.value)
 
 
 def test_missing_required_field_is_reported_after_one_retry(monkeypatch):

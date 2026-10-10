@@ -120,9 +120,9 @@ OLLAMA_MODEL=qwen2.5:3b
 - The app will still allow the user to view saved reports when AI analysis is unavailable; it does not auto-approve work orders.
 - The bundled `.env.example` binds Streamlit to loopback. Do not bind to a public interface without adding authentication, access controls, and a secure deployment configuration.
 
-## Hosted deployment and provider selection
+## Streamlit Community Cloud deployment and provider selection
 
-The application currently defaults to the local Ollama provider:
+Local development defaults to Ollama:
 
 ```env
 AI_PROVIDER=ollama
@@ -130,16 +130,54 @@ OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:3b
 ```
 
-For a remote provider, use:
+Ollama running on your development computer is not reachable from a Community
+Cloud app through `localhost`. Select a hosted provider for deployment. To use
+OpenAI, add these values in the app's **Settings > Secrets** page in Streamlit
+Community Cloud. Replace the model and placeholder with values for your
+account; do not add a real key to this repository:
 
-```env
-AI_PROVIDER=openai
-OPENAI_API_KEY=your_key
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_BASE_URL=https://api.openai.com/v1
+```toml
+AI_PROVIDER = "openai"
+OPENAI_API_KEY = "replace-with-your-provider-key"
+OPENAI_MODEL = "gpt-4o-mini"
 ```
 
-A hosted deployment must explicitly configure its service to bind on the interface required by its platform, provide persistent database storage, and add authentication and access controls. The application has no built-in user authentication or role-based access control; hosted deployment has not been verified.
+`OPENAI_BASE_URL` is optional for OpenAI. For an OpenAI-compatible service with
+a different endpoint, configure all four values in Streamlit secrets:
+
+```toml
+AI_PROVIDER = "openai_compatible"
+OPENAI_API_KEY = "replace-with-your-provider-key"
+OPENAI_MODEL = "provider-model-name"
+OPENAI_BASE_URL = "https://your-provider.example/v1"
+```
+
+The application reads configuration from environment variables first and
+Streamlit secrets second. Local `.env` configuration continues to work, and
+Ollama remains the default when `AI_PROVIDER` is not set.
+
+Deployment steps:
+
+1. Ensure the GitHub repository contains `app.py`, `requirements.txt`, `src/`,
+   and `data/manuals/`.
+2. In Streamlit Community Cloud, create an app for `Harsh28-HB/MaintainAI`
+   and set the entry point to `app.py`.
+3. Add the provider values above in **Settings > Secrets**. Keep the API key
+   only in the secrets editor; never commit `.streamlit/secrets.toml`.
+4. Restart/redeploy after changing secrets, then test issue analysis with the
+   configured hosted provider.
+
+The configured OpenAI-compatible service must support chat completions and
+JSON-object response formatting. MaintainAI validates the returned schema and
+retrieved-manual citations before displaying an analysis. Findings remain
+advisory, and work orders still require technician review.
+
+Streamlit Community Cloud's local filesystem is not durable storage. This app
+currently uses SQLite, so records may be lost when the app is restarted or
+redeployed; use durable database/storage before relying on hosted records. The
+app also has no built-in authentication or role-based access control. Hosted
+deployment, provider availability, and production security have not been
+verified.
 
 ## Launching the Streamlit application
 
@@ -264,22 +302,25 @@ Important: the threshold values used by the project are demo values for the appl
 ## Known limitations
 
 - The app is designed for local demonstration and maintenance coordination, not remote equipment control.
-- The AI workflow depends on a reachable local Ollama instance.
+- The AI workflow requires either a local Ollama service or a reachable hosted
+  provider configured with valid credentials.
 - The AI output is advisory and always requires technician review and approval.
 - There is no production-grade hosted deployment in this repository. Any hosted deployment would require a reachable inference service, secure configuration, and production hardening.
 - The app intentionally does not auto-approve or auto-execute maintenance actions.
 
 ## Deployment instructions and required configuration
 
-This repository does not include a tested hosted deployment. To deploy it in a more production-like environment, the following must be configured:
+The Community Cloud instructions above configure the application runtime and
+hosted AI provider, but do not make the app production-ready. Before using it
+with real operational records, address the following:
 
-- a persistent SQLite database or a managed database backend
-- a reachable Ollama endpoint or an equivalent model-serving service
-- environment variables such as `OLLAMA_URL` and `OLLAMA_MODEL`
-- secure handling of secrets and local configuration files
-- reverse proxy or app runtime configuration if hosting in a shared environment
+- durable database storage or a managed database backend
+- authentication and access controls for intended users
+- secure handling of provider secrets and local configuration files
+- operational monitoring, backups, and recovery procedures
 
-Use a local or secure network-only deployment model until the runtime is validated in the target environment.
+Validate provider, storage, and access-control configuration in the target
+environment before relying on a deployment.
 
 ## Completed functionality versus excluded scope
 
@@ -298,7 +339,7 @@ Excluded from the current scope:
 - remote equipment control or automatic maintenance activation
 - production-grade distributed deployment
 - verified manufacturer safety-limit configuration
-- hosted deployment verification
+- production-grade hosted deployment verification
 - enterprise-grade authentication or RBAC
 
 ## Operational and deployment limitations
@@ -306,5 +347,5 @@ Excluded from the current scope:
 - AI analysis is advisory, session-scoped, and is not retained in the database.
 - The bundled manual and sensor limits are illustrative and not manufacturer-verified.
 - SQLite contains issue, work-order, and audit history. Backups and schema migration tooling are not provided.
-- Streamlit's local development server is not a production deployment. Authentication, authorization, deployment hardening, and hosted-provider availability have not been verified.
+- Authentication, authorization, deployment hardening, durable hosted storage, and hosted-provider availability have not been verified.
 - Automated tests use isolated temporary databases; they do not certify a live AI provider or deployed environment.
