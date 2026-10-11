@@ -944,7 +944,7 @@ def status_badge(status: str) -> str:
 
 def priority_badge(priority: str) -> str:
     return (
-        f'<span class="priority-badge">Priority: '
+        f'<span class="priority-badge">Triage recommendation: '
         f'{escape(str(priority).replace("_", " ").title())}</span>'
     )
 
@@ -1527,7 +1527,7 @@ def render_dashboard_page():
                         </div>
                         <div class="work-order-summary">{escape(str(draft.get("summary") or order["description"]))}</div>
                         <div class="activity-meta">{escape(str(order["equipment_id"]))} · Issue #{int(order["issue_id"])} · {escape(str(technician))}</div>
-                        <span class="priority-badge">Priority: {escape(priority.replace("_", " ").title())}</span>
+                        <span class="priority-badge">Triage recommendation: {escape(priority.replace("_", " ").title())}</span>
                     </div>
                     """,
                     unsafe_allow_html=True,

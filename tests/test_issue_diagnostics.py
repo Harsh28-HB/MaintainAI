@@ -425,7 +425,12 @@ def test_approved_status_is_distinct_from_priority_and_actions_are_unique(
             "actions": [instruction, instruction, instruction],
         },
     )
-    database.review_work_order(work_order_id, "approved", "Technician A")
+    database.review_work_order(
+        work_order_id,
+        "approved",
+        "Technician A",
+        "Reviewed supporting evidence.",
+    )
 
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     app = AppTest.from_file(str(app_path), default_timeout=30)
@@ -440,9 +445,12 @@ def test_approved_status_is_distinct_from_priority_and_actions_are_unique(
     ]
     rendered = "\n".join(item.value for item in app.markdown)
     assert rendered.count("Approved for maintenance work") == 1
-    assert "Priority: Requires Review" in rendered
+    assert "Triage recommendation: Requires Review" in rendered
+    assert "Priority: Requires Review" not in rendered
     assert "Pending Review" not in rendered
     assert rendered.count(instruction) == 1
+    assert "Reviewed by: Technician A" in rendered
+    assert "Technician notes: Reviewed supporting evidence." in rendered
     assert any(
         "does not authorize equipment operation" in item.value
         for item in app.markdown
