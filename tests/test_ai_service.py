@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from src import ai_service
 
@@ -16,25 +17,75 @@ EVIDENCE = [{
 
 
 def test_config_reads_streamlit_secret_when_environment_is_unset(monkeypatch):
-    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
     monkeypatch.setattr(
         ai_service,
         "_streamlit_secret",
-        lambda name: "cloud-model" if name == "OPENAI_MODEL" else None,
+        lambda name: "demo" if name == "AI_PROVIDER" else None,
     )
 
-    assert ai_service._config_value("OPENAI_MODEL") == "cloud-model"
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "demo"
 
 
-def test_environment_config_takes_precedence_over_streamlit_secret(monkeypatch):
-    monkeypatch.setenv("OPENAI_MODEL", "environment-model")
+def test_environment_provider_is_used_when_streamlit_secret_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setenv("AI_PROVIDER", "demo")
     monkeypatch.setattr(
         ai_service,
         "_streamlit_secret",
-        lambda name: "cloud-model",
+        lambda name: None,
     )
 
-    assert ai_service._config_value("OPENAI_MODEL") == "environment-model"
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "demo"
+
+
+def test_streamlit_provider_secret_takes_precedence_over_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("AI_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        ai_service,
+        "_streamlit_secret",
+        lambda name: "demo" if name == "AI_PROVIDER" else None,
+    )
+
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "demo"
+
+
+def test_unavailable_streamlit_secrets_do_not_break_environment_config(
+    monkeypatch,
+):
+    monkeypatch.setenv("AI_PROVIDER", "ollama")
+
+    def unavailable_secrets(name):
+        raise StreamlitSecretNotFoundError("No secrets configured")
+
+    monkeypatch.setattr(
+        ai_service.st,
+        "secrets",
+        SimpleNamespace(get=unavailable_secrets),
+    )
+
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "ollama"
+
+
+def test_missing_provider_configuration_defaults_to_ollama(monkeypatch):
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
+    monkeypatch.setattr(ai_service, "_streamlit_secret", lambda name: None)
+
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "ollama"
+
+
+def test_explicit_ollama_provider_is_preserved(monkeypatch):
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
+    monkeypatch.setattr(
+        ai_service,
+        "_streamlit_secret",
+        lambda name: "ollama" if name == "AI_PROVIDER" else None,
+    )
+
+    assert ai_service._config_value("AI_PROVIDER", "ollama") == "ollama"
 
 
 class FakeResponse:

@@ -170,13 +170,16 @@ OPENAI_MODEL = "provider-model-name"
 OPENAI_BASE_URL = "https://your-provider.example/v1"
 ```
 
-The application reads configuration from environment variables first and
-Streamlit secrets second. Local `.env` configuration continues to work.
+The application reads root-level Streamlit secrets first, then environment
+variables, then the documented default. This lets an explicitly configured
+Cloud provider such as `AI_PROVIDER = "demo"` take effect even if the runtime
+also has a provider environment variable. Local `.env` and PowerShell
+environment configuration continue to work when the corresponding Streamlit
+secret is not set. Restart the app after changing secrets or environment
+configuration.
 `AI_PROVIDER=ollama` remains the local default when the provider is unset.
 Ollama running on your development computer is not reachable by a Community
-Cloud app through `localhost`. A process environment setting takes precedence
-over Streamlit secrets, so remove any deployment environment setting that
-conflicts with the selected provider.
+Cloud app through `localhost`.
 
 For local development, set the provider explicitly in `.env`:
 
@@ -196,10 +199,7 @@ OLLAMA_MODEL=qwen2.5:3b
 
 Because provider settings are loaded when the AI service module is imported,
 stop and restart the Streamlit server after editing `.env` or changing secrets.
-An `AI_PROVIDER=ollama` environment value takes precedence over an
-`AI_PROVIDER="openai"` Streamlit secret; change or remove the environment value
-to select OpenAI. The AI service logs the selected provider name only and never
-logs the API key.
+The AI service logs the selected provider name only and never logs credentials.
 
 Deployment steps:
 

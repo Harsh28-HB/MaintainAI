@@ -52,16 +52,20 @@ _OPERATIONAL_CLEARANCE_CLAIM = re.compile(
 def _streamlit_secret(name: str) -> str | None:
     try:
         value = st.secrets.get(name)
-    except StreamlitSecretNotFoundError:
+    except (StreamlitSecretNotFoundError, KeyError):
         return None
     return str(value).strip() if value is not None else None
 
 
 def _config_value(name: str, default: str = "") -> str:
+    streamlit_value = _streamlit_secret(name)
+    if streamlit_value:
+        return streamlit_value
+
     environment_value = os.getenv(name, "").strip()
     if environment_value:
         return environment_value
-    return _streamlit_secret(name) or default
+    return default
 
 
 AI_PROVIDER = _config_value("AI_PROVIDER", "ollama").lower()
