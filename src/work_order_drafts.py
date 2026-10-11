@@ -12,13 +12,36 @@ ALLOWED_PRIORITIES = {
 }
 
 
-def draft_from_analysis(analysis: Any) -> dict[str, Any]:
-    """Build a persisted work-order draft from validated AI output."""
-    if not isinstance(analysis, dict):
-        raise ValueError("A valid AI analysis is required to create a draft.")
+def _unique_actions(actions: list[str]) -> list[str]:
+    """Remove exact duplicate instructions while preserving their order."""
+    unique = []
+    seen = set()
+    for action in actions:
+        normalized = action.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
 
-    if analysis.get("ai_generated") is not True:
-        raise ValueError("Only a validated AI analysis can create a work-order draft.")
+
+def draft_from_analysis(analysis: Any) -> dict[str, Any]:
+    """Build a persisted draft from validated AI or deterministic demo output."""
+    if not isinstance(analysis, dict):
+        raise ValueError(
+            "A valid AI analysis or deterministic demo guidance is required "
+            "to create a draft."
+        )
+
+    validated_ai = analysis.get("ai_generated") is True
+    deterministic_demo = (
+        analysis.get("ai_provider") == "demo"
+        and analysis.get("ai_generated") is False
+    )
+    if not (validated_ai or deterministic_demo):
+        raise ValueError(
+            "Only validated AI analysis or deterministic demo guidance can "
+            "create a work-order draft."
+        )
 
     ai_draft = analysis.get("draft_work_order")
     if not isinstance(ai_draft, dict):
@@ -61,6 +84,26 @@ def draft_from_analysis(analysis: Any) -> dict[str, Any]:
     return {
         "summary": summary.strip(),
         "priority": priority,
-        "actions": [action.strip() for action in actions if action.strip()],
+        "actions": _unique_actions(actions),
         "evidence_citations": citations,
+    }
+
+
+def draft_from_issue(issue: Any) -> dict[str, Any]:
+    """Build a review-only draft from a persisted issue without analysis."""
+    if not isinstance(issue, dict):
+        raise ValueError("A saved issue is required to create a work-order draft.")
+
+    description = issue.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("The saved issue description is missing.")
+
+    return {
+        "summary": "Technician review of reported issue",
+        "priority": "requires_review",
+        "actions": [
+            "Review the saved issue report and determine the required "
+            "maintenance work."
+        ],
+        "evidence_citations": [],
     }

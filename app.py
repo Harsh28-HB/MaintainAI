@@ -1,5 +1,6 @@
 import logging
 import json
+import math
 from html import escape
 
 import streamlit as st
@@ -8,17 +9,27 @@ from src.database import (
     init_db,
     register_equipment,
     create_issue,
+    create_work_order_once,
     create_analysis_work_order_once,
     update_work_order_draft,
     review_work_order,
+    get_issue,
+    get_issue_options,
     get_issue_history,
     get_work_orders,
 )
 from src.dashboard import equipment_health_state, get_dashboard_summary
 from src.rules import evaluate_sensor_readings
 from src.retrieval import search_manuals
-from src.ai_service import analyze_issue, AIServiceError
-from src.work_order_drafts import draft_from_analysis
+from src.ai_service import (
+    AI_PROVIDER,
+    DEMO_MODE_NOTICE,
+    OPENAI_API_KEY,
+    AIServiceError,
+    analyze_issue,
+)
+from src.issue_diagnostics import report_issue_workflow_error
+from src.work_order_drafts import draft_from_analysis, draft_from_issue
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("maintainai.app")
@@ -510,9 +521,9 @@ st.markdown(
         }
 
         .status-draft {
-            background: rgba(20,184,166,0.12);
-            color: #5EEAD4;
-            border-color: rgba(20,184,166,0.25);
+            background: rgba(245,158,11,0.12);
+            color: #FCD34D;
+            border-color: rgba(245,158,11,0.25);
         }
 
         .status-approved {
@@ -550,6 +561,16 @@ st.markdown(
             background: rgba(148,163,184,0.12);
             color: #CBD5E1;
             border-color: rgba(148,163,184,0.22);
+        }
+
+        .priority-badge {
+            display: inline-block;
+            color: #CBD5E1;
+            background: rgba(148,163,184,0.08);
+            border: 1px solid rgba(148,163,184,0.22);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            padding: 0.2rem 0.45rem;
         }
 
         .priority-urgent {
@@ -893,6 +914,18 @@ st.markdown(
 init_db()
 
 st.session_state.setdefault("current_page", "Dashboard")
+if AI_PROVIDER == "demo":
+    st.info(DEMO_MODE_NOTICE)
+
+
+def work_order_status_label(status: str) -> str:
+    normalized = str(status).lower().replace(" ", "_")
+    return {
+        "draft": "Pending Review",
+        "approved": "Approved for maintenance work",
+        "rejected": "Rejected",
+        "completed": "Completed",
+    }.get(normalized, str(status))
 
 
 def status_badge(status: str) -> str:
@@ -903,19 +936,17 @@ def status_badge(status: str) -> str:
         "rejected": "status-rejected",
         "completed": "status-completed",
     }.get(normalized, "status-draft")
-    return f'<span class="status-badge {css}">{escape(str(status))}</span>'
+    return (
+        f'<span class="status-badge {css}">'
+        f'{escape(work_order_status_label(status))}</span>'
+    )
 
 
 def priority_badge(priority: str) -> str:
-    normalized = str(priority).lower().replace(" ", "_")
-    css = {
-        "urgent": "priority-urgent",
-        "high": "priority-high",
-        "medium": "priority-medium",
-        "routine": "priority-routine",
-        "requires_review": "priority-requires_review",
-    }.get(normalized, "priority-routine")
-    return f'<span class="status-badge {css}">{escape(str(priority))}</span>'
+    return (
+        f'<span class="priority-badge">Priority: '
+        f'{escape(str(priority).replace("_", " ").title())}</span>'
+    )
 
 
 def metric_card(
@@ -939,21 +970,49 @@ def metric_card(
 
 
 def render_sensor_results(results):
-    st.markdown('<div class="section-title">Deterministic sensor checks</div>', unsafe_allow_html=True)
+    st.subheader("Sensor validation and missing readings")
+    sensor_results = results.get("results", [])
+    review_statuses = {"missing", "invalid", "conflicting"}
+    readings_for_review = [
+        result
+        for result in sensor_results
+        if result.get("status") in review_statuses
+    ]
 
-    if results.get("has_alerts"):
-        st.warning("One or more readings exceeded the configured demo thresholds.")
-    if results.get("has_warnings"):
-        st.info("Some readings need technician review because they are missing, invalid, or conflicting.")
+    if readings_for_review:
+        st.warning(
+            "The following measurements are missing, invalid, or conflicting "
+            "and need verification:"
+        )
+        for result in readings_for_review:
+            status = result["status"].replace("_", " ").title()
+            st.warning(f"{status} measurement — {result['metric']}: {result['message']}")
+    elif not sensor_results:
+        st.info("No sensor validation results are available.")
 
-    for result in results.get("results", []):
-        with st.expander(f"{result['metric']} · {result['status']}", expanded=False):
-            st.write(result["message"])
-            if "value" in result:
-                st.write(f"Reading: {result['value']} {result.get('unit', '')}")
-            st.write("Configured threshold:", result["threshold"])
+    for result in sensor_results:
+        if result.get("status") in review_statuses:
+            continue
+        if result.get("status") == "threshold_exceeded":
+            st.warning(
+                f"{result['metric']}: {result['message']} "
+                "This is an illustrative demo-rule result, not a verified "
+                "equipment safety limit."
+            )
+        else:
+            st.write(
+                f"**{result['metric']} — {result['status'].replace('_', ' ').title()}**"
+            )
+            st.caption(
+                "This comparison uses an illustrative demo rule only; it "
+                "does not establish operational safety."
+            )
 
-    st.caption(results.get("note", "Demo thresholds are illustrative and not verified safety limits."))
+    st.caption(results.get(
+        "note",
+        "Demo thresholds are illustrative and are not verified equipment "
+        "safety limits.",
+    ))
 
 
 def render_analysis_results_page():
@@ -961,61 +1020,57 @@ def render_analysis_results_page():
         """
         <div class="page-header">
             <h1>Analysis Results</h1>
-            <p>Advisory findings are generated from evidence and deterministic checks.</p>
+            <p>Advisory guidance is based on the selected provider, retrieved evidence, and deterministic checks.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     if "last_analysis" not in st.session_state:
-        st.info("No AI analysis has been generated yet. Submit an issue from the Report an Issue page.")
+        if AI_PROVIDER == "demo":
+            st.info("No demo guidance has been generated yet. Submit an issue from the Report an Issue page.")
+        else:
+            st.info("No AI analysis has been generated yet. Submit an issue from the Report an Issue page.")
         return
 
     analysis = st.session_state["last_analysis"]
     evidence = st.session_state.get("last_evidence", [])
     issue = st.session_state.get("last_issue", {})
 
-    st.markdown(
-        '<div class="alert-box">AI output is advisory only. It does not approve a work order or operate equipment.</div>',
-        unsafe_allow_html=True,
-    )
+    if analysis.get("ai_provider") == "demo":
+        st.info(DEMO_MODE_NOTICE)
+    else:
+        st.markdown(
+            '<div class="alert-box">AI output is advisory only. It does not approve a work order or authorize equipment operation.</div>',
+            unsafe_allow_html=True,
+        )
 
-    st.subheader("Issue summary")
+    st.subheader("Issue analysis and available evidence")
+    st.markdown('<div class="section-title">Reported issue</div>', unsafe_allow_html=True)
     st.write(issue.get("description", "No issue description available."))
 
-    if "last_sensor_results" in st.session_state:
-        render_sensor_results(st.session_state["last_sensor_results"])
+    st.markdown('<div class="section-title">Observations</div>', unsafe_allow_html=True)
+    for item in analysis.get("observations", []):
+        st.write(f"• {item.get('text', '')}")
+        for citation in item.get("citations", []):
+            st.caption(f"Evidence: {citation}")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-title">Possible causes</div>', unsafe_allow_html=True)
-        if analysis.get("possible_causes"):
-            for item in analysis["possible_causes"]:
-                st.markdown("- **%s**" % item.get("text", ""))
-                if item.get("citations"):
-                    for citation in item["citations"]:
-                        st.caption(f"Evidence: {citation}")
-        else:
-            st.write("No possible causes were provided.")
-
-    with col2:
-        st.markdown('<div class="section-title">Follow-up questions</div>', unsafe_allow_html=True)
-        if analysis.get("follow_up_questions"):
-            for item in analysis["follow_up_questions"]:
-                st.write(f"**Q:** {item.get('question', '')}")
-                st.caption(item.get("reason", ""))
-        else:
-            st.write("No follow-up questions were proposed.")
-
-    st.markdown('<div class="section-title">Inspection steps</div>', unsafe_allow_html=True)
-    for item in analysis.get("inspection_steps", []):
-        with st.container():
-            st.write(f"• {item.get('action', '')}")
-            st.caption(item.get("reason", ""))
+    st.markdown('<div class="section-title">Possible causes (unconfirmed)</div>', unsafe_allow_html=True)
+    possible_causes = analysis.get("possible_causes", [])
+    if possible_causes:
+        for item in possible_causes:
+            st.write(f"• {item.get('text', '')}")
             for citation in item.get("citations", []):
                 st.caption(f"Evidence: {citation}")
+    else:
+        st.write("No possible causes were provided.")
 
-    st.markdown('<div class="section-title">Priority and rationale</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Follow-up questions</div>', unsafe_allow_html=True)
+    for item in analysis.get("follow_up_questions", []):
+        st.write(f"**Q:** {item.get('question', '')}")
+        st.caption(item.get("reason", ""))
+
+    st.markdown('<div class="section-title">Priority and rationale (advisory)</div>', unsafe_allow_html=True)
     st.markdown(priority_badge(analysis.get("proposed_priority", "requires_review")), unsafe_allow_html=True)
     st.write(analysis.get("priority_rationale", "No priority rationale was provided."))
 
@@ -1027,18 +1082,6 @@ def render_analysis_results_page():
     else:
         st.info("No manual evidence was available for this issue.")
 
-    st.markdown('<div class="section-title">Draft work order</div>', unsafe_allow_html=True)
-    draft = analysis.get("draft_work_order", {})
-    if draft:
-        st.write(draft.get("summary", ""))
-        st.markdown(priority_badge(draft.get("priority", "requires_review")), unsafe_allow_html=True)
-        for action in draft.get("actions", []):
-            st.write(f"• {action}")
-        if draft.get("evidence_citations"):
-            st.caption("Evidence citations: " + ", ".join(draft["evidence_citations"]))
-    else:
-        st.write("No draft work order was generated.")
-
     st.markdown('<div class="section-title">Evidence limitations</div>', unsafe_allow_html=True)
     limitations = analysis.get("evidence_limitations", [])
     if limitations:
@@ -1047,90 +1090,195 @@ def render_analysis_results_page():
     else:
         st.write("No explicit evidence limitations were reported.")
 
-    st.divider()
-    st.markdown(
-        '<div class="section-title">Create technician-review draft</div>',
-        unsafe_allow_html=True,
-    )
-    issue_id = st.session_state.get("last_issue_id")
-    if not isinstance(issue_id, int) or isinstance(issue_id, bool) or issue_id < 1:
-        st.warning(
-            "This analysis is not linked to a saved issue. Submit the issue "
-            "through Report an Issue before creating a work order."
+    sensor_results = st.session_state.get("last_sensor_results", {})
+    if isinstance(sensor_results, dict):
+        render_sensor_results(sensor_results)
+    else:
+        st.warning("Sensor validation data is unavailable and requires review.")
+
+    st.subheader("Recommended next action")
+    sensor_findings = [
+        result
+        for result in sensor_results.get("results", [])
+        if result.get("status") in {"missing", "invalid", "conflicting"}
+    ] if isinstance(sensor_results, dict) else []
+    if sensor_findings:
+        st.write("Obtain and verify each measurement listed above:")
+        for result in sensor_findings:
+            st.write(f"• {result['metric']} — {result['status'].title()}")
+    else:
+        st.write(
+            "Have a qualified technician verify the reported condition, "
+            "readings, and applicable site procedure."
         )
-        return
+    st.write(
+        "A qualified technician should review the issue and any cited manual "
+        "passages before deciding on maintenance work."
+    )
+    for item in analysis.get("inspection_steps", []):
+        st.write(f"• {item.get('action', '')}")
+        st.caption(item.get("reason", ""))
+        for citation in item.get("citations", []):
+            st.caption(f"Evidence: {citation}")
 
-    try:
-        work_order_draft = draft_from_analysis(analysis)
-    except ValueError as exc:
-        st.warning(str(exc))
-        return
+    issue_id = st.session_state.get("last_issue_id")
+    valid_issue_id = (
+        isinstance(issue_id, int)
+        and not isinstance(issue_id, bool)
+        and issue_id > 0
+    )
+    existing_order = None
+    work_order_lookup_failed = False
+    if valid_issue_id:
+        try:
+            existing_orders = get_work_orders(issue_id)
+            existing_order = existing_orders[0] if existing_orders else None
+        except Exception:
+            logger.exception("Could not check for an existing analysis work order")
+            work_order_lookup_failed = True
 
-    try:
-        existing_orders = get_work_orders(issue_id)
-    except Exception:
-        logger.exception("Could not check for an existing analysis work order")
+    draft = analysis.get("draft_work_order", {})
+    if draft:
+        st.markdown('<div class="section-title">Proposed work-order content</div>', unsafe_allow_html=True)
+        st.write(draft.get("summary", ""))
+        st.markdown(priority_badge(draft.get("priority", "requires_review")), unsafe_allow_html=True)
+        for action in draft.get("actions", []):
+            st.write(f"• {action}")
+        if draft.get("evidence_citations"):
+            st.caption("Evidence citations: " + ", ".join(draft["evidence_citations"]))
+    else:
+        st.info("No proposed work-order content was generated.")
+
+    if not valid_issue_id:
+        st.warning(
+            "This analysis is not linked to a saved issue, so a work order "
+            "cannot be created."
+        )
+    elif work_order_lookup_failed:
         st.error(
             "Saved work orders could not be checked. Please retry; no new "
             "work order was created."
         )
-        return
-
-    existing_order = existing_orders[0] if existing_orders else None
-    if existing_order:
-        st.info(
-            f"Issue #{issue_id} already has work order "
-            f"#{existing_order['work_order_id']} ({existing_order['status']}). "
-            "No duplicate draft was created."
-        )
-    elif st.button(
-        "Generate Work Order Draft",
-        type="primary",
-        key=f"generate-analysis-work-order-{issue_id}",
-    ):
+    elif not existing_order:
         try:
-            work_order_id, created = create_analysis_work_order_once(
-                issue_id,
-                work_order_draft,
+            work_order_draft = draft_from_analysis(analysis)
+        except ValueError as exc:
+            st.warning(str(exc))
+        else:
+            if st.button(
+                "Save Work Order as Pending Review",
+                type="primary",
+                key=f"generate-analysis-work-order-{issue_id}",
+            ):
+                try:
+                    work_order_id, created = create_analysis_work_order_once(
+                        issue_id,
+                        work_order_draft,
+                    )
+                except (ValueError, TypeError) as exc:
+                    st.error(str(exc))
+                except Exception:
+                    logger.exception(
+                        "Could not create analysis work order for issue %s",
+                        issue_id,
+                    )
+                    st.error(
+                        "The work-order draft could not be saved. Your issue "
+                        "and analysis remain available; please retry."
+                    )
+                else:
+                    if created:
+                        existing_order = {
+                            "work_order_id": work_order_id,
+                            "status": "draft",
+                        }
+                    else:
+                        try:
+                            refreshed_orders = get_work_orders(issue_id)
+                            existing_order = next(
+                                (
+                                    order for order in refreshed_orders
+                                    if order["work_order_id"] == work_order_id
+                                ),
+                                None,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not refresh status for work order %s",
+                                work_order_id,
+                            )
+                            work_order_lookup_failed = True
+                            st.error(
+                                "The existing work-order status could not be "
+                                "verified. Check Work Orders before proceeding."
+                            )
+                        if existing_order is None and not work_order_lookup_failed:
+                            work_order_lookup_failed = True
+                            st.error(
+                                "The existing work-order status could not be "
+                                "verified. Check Work Orders before proceeding."
+                            )
+                    st.session_state[f"analysis_work_order_{issue_id}"] = work_order_id
+                    if created:
+                        st.success(
+                            f"Work order #{work_order_id} was saved as "
+                            "Pending Review. It has not been approved."
+                        )
+                    else:
+                        st.info(
+                            f"Work order #{work_order_id} already exists for "
+                            f"issue #{issue_id}; no duplicate was created."
+                        )
+
+    st.subheader("Work-order status and required human review")
+    if existing_order:
+        status = existing_order["status"]
+        st.markdown(status_badge(status), unsafe_allow_html=True)
+        if status == "draft":
+            st.info(
+                "A qualified human technician must review this draft before "
+                "maintenance work is approved."
             )
-        except (ValueError, TypeError) as exc:
-            st.error(str(exc))
-        except Exception:
-            logger.exception(
-                "Could not create analysis work order for issue %s",
-                issue_id,
+        elif status == "approved":
+            st.info(
+                "Approved for maintenance work only. This is not permission "
+                "to operate equipment."
             )
-            st.error(
-                "The work-order draft could not be saved. Your issue and "
-                "analysis remain available; please retry."
+        elif status == "rejected":
+            st.warning(
+                "This work order was rejected. It is not approved for "
+                "maintenance work."
+            )
+    elif valid_issue_id and not work_order_lookup_failed:
+        st.info("No work order has been created for this issue.")
+
+    if existing_order:
+        if existing_order["status"] == "draft":
+            st.caption(
+                "Open Work Orders to edit this pending draft or record a "
+                "technician decision. Approval applies to maintenance work only."
             )
         else:
-            st.session_state[f"analysis_work_order_{issue_id}"] = work_order_id
-            if created:
-                st.success(
-                    f"Draft work order #{work_order_id} was saved for "
-                    f"issue #{issue_id}. It has not been approved."
-                )
-            else:
-                st.info(
-                    f"Work order #{work_order_id} already exists for "
-                    f"issue #{issue_id}; no duplicate was created."
-                )
-
-    if existing_order or st.session_state.get(
-        f"analysis_work_order_{issue_id}"
-    ):
-        st.caption(
-            "Next step: open Work Orders to edit the draft or record a "
-            "technician approval or rejection."
-        )
+            st.caption(
+                "Open Work Orders to inspect this recorded decision. The "
+                "decision does not establish equipment-operation safety."
+            )
         if st.button(
             "Review Work Orders",
             key=f"review-analysis-work-order-{issue_id}",
         ):
             st.session_state["current_page"] = "Work Orders"
             st.session_state["last_issue_id"] = issue_id
+            st.session_state["work_orders_issue_id"] = issue_id
             st.rerun()
+
+    st.subheader("Safety limitation")
+    st.warning(
+        "Operational safety not established. MaintainAI has no verified, "
+        "equipment-specific rule here to determine that this equipment is "
+        "safe or unsafe. Generated guidance and work-order approval do not "
+        "authorize equipment operation."
+    )
 
 
 def render_dashboard_page():
@@ -1239,6 +1387,7 @@ def render_dashboard_page():
                     )
                     if pending:
                         st.session_state["last_issue_id"] = pending["issue_id"]
+                        st.session_state["work_orders_issue_id"] = pending["issue_id"]
                 st.rerun()
 
     st.markdown(
@@ -1361,30 +1510,24 @@ def render_dashboard_page():
             for order in summary["work_orders"]:
                 draft = json.loads(order["draft_json"] or "{}")
                 priority = str(draft.get("priority", "requires_review"))
-                priority_class = {
-                    "urgent": "priority-urgent",
-                    "high": "priority-high",
-                    "medium": "priority-medium",
-                    "routine": "priority-routine",
-                    "requires_review": "priority-requires_review",
-                }.get(priority.lower().replace(" ", "_"), "priority-routine")
                 status_class = {
                     "draft": "status-warning",
                     "approved": "status-success",
                     "rejected": "status-critical",
                     "completed": "status-success",
                 }.get(order["status"], "status-unknown")
+                status_label = work_order_status_label(order["status"])
                 technician = order["reviewed_by"] or "Awaiting technician review"
                 st.markdown(
                     f"""
                     <div class="work-order-row">
                         <div class="equipment-item-header">
                             <strong>WO-{int(order["work_order_id"]):04d}</strong>
-                            <span class="activity-status {status_class}">{escape(str(order["status"]))}</span>
+                            <span class="activity-status {status_class}">{escape(status_label)}</span>
                         </div>
                         <div class="work-order-summary">{escape(str(draft.get("summary") or order["description"]))}</div>
                         <div class="activity-meta">{escape(str(order["equipment_id"]))} · Issue #{int(order["issue_id"])} · {escape(str(technician))}</div>
-                        <span class="status-badge {priority_class}">{escape(priority)} priority</span>
+                        <span class="priority-badge">Priority: {escape(priority.replace("_", " ").title())}</span>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1397,6 +1540,7 @@ def render_dashboard_page():
         if st.button("Open Work Orders", key="dashboard-open-work-orders"):
             if summary["work_orders"]:
                 st.session_state["last_issue_id"] = summary["work_orders"][0]["issue_id"]
+                st.session_state["work_orders_issue_id"] = summary["work_orders"][0]["issue_id"]
             st.session_state["current_page"] = "Work Orders"
             st.rerun()
 
@@ -1415,6 +1559,7 @@ def render_dashboard_page():
                     "approved": "status-success",
                     "completed": "status-success",
                 }.get(status.lower(), "status-unknown")
+                status = work_order_status_label(status)
                 description = row["description"] or "Maintenance record updated"
                 equipment_id = row["equipment_id"] or "Equipment not available"
                 stamp = row["created_at"] or "Timestamp unavailable"
@@ -1493,7 +1638,12 @@ def render_issue_form_page():
             ]:
                 if raw and raw.strip():
                     try:
-                        readings[key] = float(raw)
+                        numeric_reading = float(raw)
+                        readings[key] = (
+                            numeric_reading
+                            if math.isfinite(numeric_reading)
+                            else raw.strip()
+                        )
                     except ValueError:
                         readings[key] = raw
 
@@ -1527,30 +1677,72 @@ def render_issue_form_page():
                 )
 
             st.session_state["last_issue_id"] = issue_id
+            st.session_state["work_orders_issue_id"] = issue_id
             st.session_state["last_sensor_results"] = sensor_results
             st.session_state["last_evidence"] = evidence
             st.session_state["last_issue"] = issue
             st.session_state.pop("last_analysis", None)
+            st.session_state.pop("last_analysis_issue_id", None)
 
             render_sensor_results(sensor_results)
 
-            if not evidence:
+            if not evidence and AI_PROVIDER != "demo":
                 st.warning("No relevant manual sections were found. The issue was saved, but AI analysis was not generated.")
                 st.info("Saved issue records remain available in Maintenance History.")
                 return
 
-            with st.spinner("Analyzing the issue with the configured AI provider..."):
+            spinner_message = (
+                "Preparing deterministic demo guidance..."
+                if AI_PROVIDER == "demo"
+                else "Analyzing the issue with the configured AI provider..."
+            )
+            with st.spinner(spinner_message):
                 analysis = analyze_issue(issue, sensor_results, evidence)
 
             st.session_state["last_analysis"] = analysis
-            st.success(f"Issue #{issue_id} was saved and analyzed successfully.")
+            st.session_state["last_analysis_issue_id"] = issue_id
+            completion = (
+                "demo guidance prepared"
+                if analysis.get("ai_provider") == "demo"
+                else "analyzed successfully"
+            )
+            st.success(f"Issue #{issue_id} was saved and {completion}.")
 
         except (ValueError, AIServiceError) as exc:
-            logger.warning("Issue workflow could not complete: %s", type(exc).__name__)
-            st.error(str(exc))
-        except Exception:
-            logger.exception("Unexpected issue workflow failure")
-            st.error("The report workflow failed unexpectedly. Check the application logs and try again.")
+            report_issue_workflow_error(
+                exc,
+                AI_PROVIDER,
+                (
+                    equipment_id,
+                    equipment_type,
+                    description,
+                    events_text,
+                    vibration,
+                    temperature,
+                    pressure,
+                    OPENAI_API_KEY,
+                ),
+                st.error,
+            )
+        except Exception as exc:
+            report_issue_workflow_error(
+                exc,
+                AI_PROVIDER,
+                (
+                    equipment_id,
+                    equipment_type,
+                    description,
+                    events_text,
+                    vibration,
+                    temperature,
+                    pressure,
+                    OPENAI_API_KEY,
+                ),
+                lambda _message: st.error(
+                    "The report workflow failed unexpectedly. "
+                    "Check the application logs and try again."
+                ),
+            )
 
 
 def render_work_orders_page():
@@ -1558,18 +1750,46 @@ def render_work_orders_page():
         """
         <div class="page-header">
             <h1>Work orders</h1>
-            <p>Review and maintain draft work orders with technician approval or rejection.</p>
+            <p>Review and maintain work orders with technician approval or rejection. Approval applies to maintenance work only and does not authorize equipment operation.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    issue_id = st.number_input(
-        "Issue ID",
-        min_value=1,
-        step=1,
-        value=int(st.session_state.get("last_issue_id", 1)),
+    try:
+        issue_options = get_issue_options()
+    except Exception:
+        logger.exception("Could not load saved issue options for work orders")
+        st.error("Saved issues could not be loaded. Check the application logs and try again.")
+        return
+    if not issue_options:
+        st.info("No saved issues are available. Report an issue before creating a work order.")
+        return
+
+    issue_ids = [int(item["issue_id"]) for item in issue_options]
+    preferred_issue_id = st.session_state.get(
+        "work_orders_issue_id",
+        st.session_state.get("last_issue_id"),
     )
+    if preferred_issue_id not in issue_ids:
+        preferred_issue_id = issue_ids[0]
+    if "work_orders_issue_id" not in st.session_state:
+        st.session_state["work_orders_issue_id"] = preferred_issue_id
+
+    issue_descriptions = {
+        int(item["issue_id"]): str(item["description"])
+        for item in issue_options
+    }
+    issue_id = st.selectbox(
+        "Select saved issue",
+        issue_ids,
+        format_func=lambda value: (
+            f"Issue #{value} — {issue_descriptions[value][:70]}"
+        ),
+        key="work_orders_issue_id",
+    )
+    issue_id = int(issue_id)
+    st.session_state["last_issue_id"] = issue_id
 
     try:
         orders = get_work_orders(int(issue_id))
@@ -1578,13 +1798,94 @@ def render_work_orders_page():
         st.error("Work orders could not be loaded. Check the application logs and try again.")
         return
     if not orders:
-        st.info("No work orders exist for this issue. Generate or save an issue draft to create one.")
-        return
+        try:
+            issue = get_issue(int(issue_id))
+        except Exception:
+            logger.exception("Could not load saved issue %s", issue_id)
+            st.error("The saved issue could not be loaded. Check the application logs and try again.")
+            return
+
+        if issue is None:
+            st.warning(f"Issue #{int(issue_id)} was not found. Select a saved issue ID.")
+            return
+
+        st.caption(
+            "Create a technician-review draft from this saved issue. "
+            "The draft will be linked to this issue and will not be approved."
+        )
+        if st.button(
+            "Create Work Order Draft",
+            type="primary",
+            key=f"create-work-order-{int(issue_id)}",
+        ):
+            try:
+                if (
+                    st.session_state.get("last_issue_id") == int(issue_id)
+                    and st.session_state.get("last_analysis_issue_id")
+                    == int(issue_id)
+                    and isinstance(st.session_state.get("last_analysis"), dict)
+                ):
+                    draft = draft_from_analysis(
+                        st.session_state["last_analysis"]
+                    )
+                else:
+                    draft = draft_from_issue(issue)
+
+                work_order_id, created = create_work_order_once(
+                    int(issue_id),
+                    draft,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            except Exception:
+                logger.exception(
+                    "Could not create work-order draft for issue %s",
+                    issue_id,
+                )
+                st.error(
+                    "The work-order draft could not be saved. The issue remains "
+                    "available; check the application logs and try again."
+                )
+                return
+
+            if created:
+                st.success(
+                    f"Work order #{work_order_id} was saved with Pending "
+                    "Review status. It has not been approved."
+                )
+            else:
+                st.info(
+                    f"Work order #{work_order_id} already exists for this "
+                    "issue; no duplicate was created."
+                )
+            try:
+                orders = get_work_orders(int(issue_id))
+            except Exception:
+                logger.exception(
+                    "Could not reload work orders for issue %s",
+                    issue_id,
+                )
+                st.error(
+                    "The draft was saved, but the work-order list could not be "
+                    "refreshed. Reopen this issue's Work Orders page."
+                )
+                return
+
+    if not orders:
+        st.info("No work order exists for this saved issue yet.")
 
     for order in orders:
         draft = order.get("draft", {})
-        with st.expander(f"Work order #{order['work_order_id']} · {order['status']}"):
+        with st.expander(f"Work order #{order['work_order_id']}"):
             st.markdown(status_badge(order["status"]), unsafe_allow_html=True)
+            if order["status"] == "approved":
+                st.info(
+                    "This maintenance approval does not establish equipment-"
+                    "operation safety or authorize equipment operation."
+                )
+            elif order["status"] == "rejected":
+                st.warning("Rejected; this work order is not approved for maintenance work.")
             st.markdown(priority_badge(draft.get("priority", "requires_review")), unsafe_allow_html=True)
             st.write(draft.get("summary", ""))
             st.write("Created:", order.get("created_at"))

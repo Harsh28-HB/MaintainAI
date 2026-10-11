@@ -187,6 +187,43 @@ def get_issue_history(equipment_id: str) -> list[dict[str, Any]]:
     return results
 
 
+def get_issue(issue_id: int) -> dict[str, Any] | None:
+    """Return one saved issue with its registered equipment type."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT i.*, e.equipment_type
+               FROM issues i
+               JOIN equipment e ON e.equipment_id = i.equipment_id
+               WHERE i.issue_id = ?""",
+            (issue_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    item = dict(row)
+    for field in (
+        "operating_events",
+        "sensor_readings",
+        "observations",
+        "possible_causes",
+        "confirmed_findings",
+    ):
+        item[field] = json.loads(item[field])
+    return item
+
+
+def get_issue_options() -> list[dict[str, Any]]:
+    """List saved issues for issue-scoped work-order navigation."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT issue_id, description
+               FROM issues
+               ORDER BY issue_id DESC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _insert_work_order(
     conn: sqlite3.Connection,
     issue_id: int,
@@ -220,11 +257,11 @@ def create_work_order(issue_id: int, draft: dict[str, Any]) -> int:
         return _insert_work_order(conn, issue_id, draft)
 
 
-def create_analysis_work_order_once(
+def create_work_order_once(
     issue_id: int,
     draft: dict[str, Any],
 ) -> tuple[int, bool]:
-    """Create one analysis-generated work order per issue, idempotently."""
+    """Create one work order per issue, idempotently."""
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
 
@@ -241,6 +278,14 @@ def create_analysis_work_order_once(
 
         work_order_id = _insert_work_order(conn, issue_id, draft)
         return work_order_id, True
+
+
+def create_analysis_work_order_once(
+    issue_id: int,
+    draft: dict[str, Any],
+) -> tuple[int, bool]:
+    """Preserve the analysis-specific API for existing callers."""
+    return create_work_order_once(issue_id, draft)
 
 
 def review_work_order(
@@ -310,7 +355,20 @@ def get_work_orders(issue_id: int) -> list[dict[str, Any]]:
     results = []
     for row in rows:
         item = dict(row)
-        item["draft"] = json.loads(item.pop("draft_json"))
+        draft = json.loads(item.pop("draft_json"))
+        actions = draft.get("actions")
+        if isinstance(actions, list):
+            unique_actions = []
+            seen_actions = set()
+            for action in actions:
+                if not isinstance(action, str):
+                    continue
+                normalized_action = action.strip()
+                if normalized_action and normalized_action not in seen_actions:
+                    seen_actions.add(normalized_action)
+                    unique_actions.append(normalized_action)
+            draft["actions"] = unique_actions
+        item["draft"] = draft
         results.append(item)
 
     return results

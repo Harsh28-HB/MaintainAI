@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -26,6 +27,26 @@ from src.retrieval import format_evidence
 load_dotenv()
 
 logger = logging.getLogger("maintainai.ai")
+
+_OPERATIONAL_SAFETY_CLAIM = re.compile(
+    r"\b(?:safe|unsafe)\b[^.!?\n]{0,80}\b"
+    r"(?:equipment|machine|pump|motor|compressor|operate|operation|"
+    r"operating|run|running)\b"
+    r"|\b(?:equipment|machine|pump|motor|compressor|operate|operation|"
+    r"operating|run|running)\b[^.!?\n]{0,80}\b(?:safe|unsafe)\b",
+    re.IGNORECASE,
+)
+_OPERATIONAL_CLEARANCE_CLAIM = re.compile(
+    r"\b(?:can|may|should|could|will|is able to|are able to)\s+"
+    r"(?:safely\s+)?(?:continue|resume|keep)\s+"
+    r"(?:normal\s+)?(?:operation|operating|running|to operate|to run)\b"
+    r"|\b(?:operation|operation of (?:the )?"
+    r"(?:equipment|machine|pump|motor|compressor))\s+"
+    r"(?:can|may|should|could|will)\s+continue\b"
+    r"|\b(?:can|may|should|could|will)\s+(?:be\s+)?"
+    r"(?:operated|run|used)\s+(?:normally|as usual|safely)\b",
+    re.IGNORECASE,
+)
 
 
 def _streamlit_secret(name: str) -> str | None:
@@ -53,6 +74,10 @@ OPENAI_API_KEY = _config_value("OPENAI_API_KEY")
 OPENAI_MODEL = _config_value("OPENAI_MODEL")
 OPENAI_BASE_URL = _config_value("OPENAI_BASE_URL").rstrip("/")
 
+DEMO_MODE_NOTICE = (
+    "Demo Mode: deterministic guidance only. No generative AI is used."
+)
+
 
 class AIServiceError(Exception):
     """Raised when AI analysis cannot safely complete."""
@@ -70,9 +95,14 @@ list of strings, even when the list is empty.
 
 Use only exact citation strings from retrieved manual evidence. Never invent
 citations, thresholds, or findings. If evidence does not support a claim, say
-so and use an empty citations list. Recommendations are advisory, preliminary,
-and safe; follow approved site isolation and safety procedures. The work order
-is always a draft and must never be approved automatically. Return JSON only.
+so and use an empty citations list. Recommendations are advisory and
+preliminary. Do not claim or imply that equipment or operation is safe or
+unsafe; this application has no verified equipment-specific rule for
+establishing operational safety. For missing, invalid, or conflicting sensor
+readings, identify each affected measurement and recommend obtaining and
+verifying it with qualified technician review. Approval of a work order is
+not permission to operate equipment. The work order is always a draft and
+must never be approved automatically. Return JSON only.
 """
 
 PRIORITIES = {
@@ -205,6 +235,25 @@ def _require_string_list(value: Any, field: str) -> None:
             )
 
 
+def _contains_unsupported_operational_safety_claim(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(
+            _OPERATIONAL_SAFETY_CLAIM.search(value)
+            or _OPERATIONAL_CLEARANCE_CLAIM.search(value)
+        )
+    if isinstance(value, dict):
+        return any(
+            _contains_unsupported_operational_safety_claim(item)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _contains_unsupported_operational_safety_claim(item)
+            for item in value
+        )
+    return False
+
+
 def _validate_result(
     result: Any,
     allowed_citations: set[str],
@@ -279,7 +328,7 @@ def _validate_result(
             )
         if any(item not in citations for item in value):
             logger.warning(
-                "Ollama output rejected for unsupported citations in %s",
+                "AI output rejected for unsupported citations in %s",
                 field,
             )
             raise AIServiceError(
@@ -356,6 +405,14 @@ def _validate_result(
         "draft_work_order.evidence_citations",
         allowed_citations,
     )
+    if _contains_unsupported_operational_safety_claim(result):
+        logger.warning(
+            "AI output rejected for unsupported equipment-operation safety claim"
+        )
+        raise AIServiceError(
+            "AI output made an unsupported equipment-operation safety claim. "
+            "The analysis was not accepted."
+        )
     return result
 
 
@@ -530,13 +587,119 @@ def _call_hosted_llm(messages: list[dict[str, str]], provider: str) -> str:
     return content
 
 
+def _build_demo_analysis(
+    issue: dict[str, Any],
+    sensor_results: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    allowed_evidence = format_evidence(evidence)
+    observations = []
+    description = str(issue.get("description", "")).strip()
+    if description:
+        observations.append({
+            "text": f"Reported issue: {description}",
+            "citations": [],
+        })
+
+    for result in sensor_results.get("results", []):
+        if result.get("status") in {
+            "threshold_exceeded",
+            "missing",
+            "invalid",
+            "conflicting",
+            "within_threshold",
+        }:
+            observations.append({
+                "text": (
+                    "Deterministic sensor check: "
+                    f"{result.get('message', 'The configured threshold was exceeded.')}"
+                ),
+                "citations": [],
+            })
+
+    if allowed_evidence:
+        inspection_steps = [{
+            "action": (
+                "Have a qualified technician review the cited manual "
+                "passage before inspection."
+            ),
+            "reason": (
+                "Review the retrieved manual passages listed in the evidence "
+                "section before inspection."
+            ),
+            "citations": [item["citation"] for item in allowed_evidence],
+        }]
+        actions = [inspection_steps[0]["action"]]
+        evidence_limitations = [
+            "This deterministic demo does not infer or diagnose equipment failures."
+        ]
+        cited_evidence = [item["citation"] for item in allowed_evidence]
+    else:
+        inspection_steps = [{
+            "action": (
+                "Have a qualified technician assess the reported condition "
+                "using approved site procedures."
+            ),
+            "reason": (
+                "No relevant manual evidence was retrieved; do not treat "
+                "this demo guidance as a substitute for the approved procedure."
+            ),
+            "citations": [],
+        }]
+        actions = [inspection_steps[0]["action"]]
+        evidence_limitations = [
+            "No relevant manual evidence was retrieved; no manual citations "
+            "are available. Guidance is limited to the reported issue and "
+            "deterministic sensor checks.",
+            "This deterministic demo does not infer or diagnose equipment failures.",
+        ]
+        cited_evidence = []
+
+    rationale = (
+        "Demo mode does not assign operational urgency. A qualified "
+        "technician must assess the issue and determine priority."
+    )
+    return {
+        "observations": observations,
+        "possible_causes": [],
+        "follow_up_questions": [
+            {
+                "question": "When was the issue first observed, and has it changed?",
+                "reason": (
+                    "A technician should establish timing and trend from "
+                    "verified operating history."
+                ),
+            },
+            {
+                "question": (
+                    "Have applicable site safety and isolation procedures "
+                    "been followed?"
+                ),
+                "reason": "Inspection must follow approved site procedures.",
+            },
+        ],
+        "inspection_steps": inspection_steps,
+        "proposed_priority": "requires_review",
+        "priority_rationale": rationale,
+        "draft_work_order": {
+            "summary": "Technician review of reported equipment issue",
+            "priority": "requires_review",
+            "actions": actions,
+            "evidence_citations": cited_evidence,
+        },
+        "evidence_limitations": evidence_limitations,
+    }
+
+
 def analyze_issue(
     issue: dict[str, Any],
     sensor_results: dict[str, Any],
     evidence: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Analyze an equipment issue using the configured AI provider."""
-    if not evidence:
+    selected_provider = AI_PROVIDER
+    logger.info("AI provider selected: %s", selected_provider)
+    if not evidence and selected_provider != "demo":
         raise AIServiceError(
             "No relevant manual evidence was retrieved. "
             "AI analysis was not generated."
@@ -546,6 +709,15 @@ def analyze_issue(
     allowed_citations = {
         item["citation"] for item in allowed_evidence
     }
+
+    if selected_provider == "demo":
+        result = _build_demo_analysis(issue, sensor_results, allowed_evidence)
+        validated_result = _validate_result(result, allowed_citations)
+        validated_result["review_status"] = "draft"
+        validated_result["ai_generated"] = False
+        validated_result["ai_provider"] = "demo"
+        validated_result["ai_model"] = None
+        return validated_result
 
     payload = {
         "issue": issue,
@@ -561,7 +733,6 @@ def analyze_issue(
         {"role": "user", "content": user_message},
     ]
 
-    selected_provider = AI_PROVIDER
     if selected_provider == "ollama":
         call_model = _call_ollama
         provider_name = "ollama"

@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
@@ -123,6 +124,188 @@ def test_analyze_issue_selects_hosted_provider_and_validates_output(
     assert result["ai_model"] == "cloud-model"
     assert result["draft_work_order"]["evidence_citations"] == [CITATION]
     assert result["review_status"] == "draft"
+
+
+def test_openai_provider_is_selected_and_logged_without_credentials(
+    monkeypatch,
+    caplog,
+):
+    caplog.set_level(logging.INFO, logger="maintainai.ai")
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "openai")
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "cloud-model")
+    monkeypatch.setattr(ai_service, "OPENAI_API_KEY", "do-not-log-this-key")
+    monkeypatch.setattr(
+        ai_service,
+        "_call_hosted_llm",
+        lambda messages, provider: json.dumps(valid_result()),
+    )
+    monkeypatch.setattr(
+        ai_service,
+        "_call_ollama",
+        lambda messages: pytest.fail("OpenAI selection called Ollama"),
+    )
+
+    result = ai_service.analyze_issue({}, {}, EVIDENCE)
+
+    assert result["ai_provider"] == "openai"
+    assert "AI provider selected: openai" in caplog.text
+    assert "do-not-log-this-key" not in caplog.text
+
+
+def test_ollama_provider_selects_local_model(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="maintainai.ai")
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "ollama")
+    monkeypatch.setattr(ai_service, "OLLAMA_MODEL", "qwen2.5:3b")
+    monkeypatch.setattr(
+        ai_service,
+        "_call_ollama",
+        lambda messages: json.dumps(valid_result()),
+    )
+    monkeypatch.setattr(
+        ai_service,
+        "_call_hosted_llm",
+        lambda messages, provider: pytest.fail(
+            "Ollama selection called hosted provider"
+        ),
+    )
+
+    result = ai_service.analyze_issue({}, {}, EVIDENCE)
+
+    assert result["ai_provider"] == "ollama"
+    assert result["ai_model"] == "qwen2.5:3b"
+    assert "AI provider selected: ollama" in caplog.text
+
+
+def test_openai_selection_with_missing_key_errors_without_ollama_fallback(
+    monkeypatch,
+):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "openai")
+    monkeypatch.setattr(ai_service, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "cloud-model")
+    monkeypatch.setattr(
+        ai_service,
+        "_call_ollama",
+        lambda messages: pytest.fail("Missing hosted key fell back to Ollama"),
+    )
+
+    with pytest.raises(
+        ai_service.AIServiceError,
+        match="OPENAI_API_KEY is missing",
+    ):
+        ai_service.analyze_issue({}, {}, EVIDENCE)
+
+
+def test_demo_provider_returns_deterministic_guidance_without_external_calls(
+    monkeypatch,
+):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "demo")
+    monkeypatch.setattr(ai_service, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(ai_service, "OPENAI_MODEL", "")
+    monkeypatch.setattr(
+        ai_service,
+        "_call_ollama",
+        lambda messages: pytest.fail("Demo mode called Ollama"),
+    )
+    monkeypatch.setattr(
+        ai_service,
+        "_call_hosted_llm",
+        lambda messages, provider: pytest.fail("Demo mode called hosted AI"),
+    )
+    sensor_results = {
+        "results": [{
+            "metric": "vibration_mm_s",
+            "status": "threshold_exceeded",
+            "message": "vibration_mm_s is above maximum.",
+        }],
+        "has_alerts": True,
+    }
+
+    result = ai_service.analyze_issue(
+        {"description": "Unusual vibration"},
+        sensor_results,
+        EVIDENCE,
+    )
+
+    assert result["ai_provider"] == "demo"
+    assert result["ai_generated"] is False
+    assert result["review_status"] == "draft"
+    assert result["possible_causes"] == []
+    assert result["observations"][1]["text"].startswith(
+        "Deterministic sensor check:"
+    )
+    assert result["inspection_steps"][0]["citations"] == [CITATION]
+    assert result["draft_work_order"]["evidence_citations"] == [CITATION]
+    assert result["proposed_priority"] == "requires_review"
+    assert "equipment_safety" not in result
+    assert "operational_safety" not in result
+
+
+def test_demo_provider_without_evidence_discloses_missing_manual_support(
+    monkeypatch,
+):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "demo")
+
+    result = ai_service.analyze_issue(
+        {"description": "Unusual vibration"},
+        {"results": [], "has_alerts": False, "has_warnings": True},
+        [],
+    )
+
+    assert result["ai_provider"] == "demo"
+    assert result["ai_generated"] is False
+    assert result["inspection_steps"][0]["citations"] == []
+    assert result["draft_work_order"]["evidence_citations"] == []
+    assert any(
+        "No relevant manual evidence was retrieved" in limitation
+        for limitation in result["evidence_limitations"]
+    )
+
+
+def test_demo_guidance_does_not_repeat_instruction_per_manual_citation(
+    monkeypatch,
+):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "demo")
+    evidence = [
+        {
+            "citation": f"pump_manual.md | Section {index} | lines {index}-{index + 1}",
+            "content": f"Manual passage {index}.",
+        }
+        for index in range(1, 4)
+    ]
+
+    result = ai_service.analyze_issue(
+        {"description": "Unusual vibration"},
+        {"results": [], "has_alerts": False, "has_warnings": False},
+        evidence,
+    )
+
+    instruction = (
+        "Have a qualified technician review the cited manual passage "
+        "before inspection."
+    )
+    assert len(result["inspection_steps"]) == 1
+    assert result["inspection_steps"][0]["action"] == instruction
+    assert len(result["inspection_steps"][0]["citations"]) == 3
+    assert result["draft_work_order"]["actions"] == [instruction]
+
+
+def test_ollama_failure_does_not_fall_back_to_hosted_provider(monkeypatch):
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "ollama")
+
+    def unavailable(messages):
+        raise ai_service.AIServiceError("Ollama request failed.")
+
+    monkeypatch.setattr(ai_service, "_call_ollama", unavailable)
+    monkeypatch.setattr(
+        ai_service,
+        "_call_hosted_llm",
+        lambda messages, provider: pytest.fail(
+            "Ollama failure fell back to hosted provider"
+        ),
+    )
+
+    with pytest.raises(ai_service.AIServiceError, match="Ollama request failed"):
+        ai_service.analyze_issue({}, {}, EVIDENCE)
 
 
 def test_hosted_provider_uses_configured_credentials_model_and_endpoint(
@@ -300,6 +483,54 @@ def test_unsupported_citation_is_rejected_without_retry(monkeypatch):
         ai_service.analyze_issue({}, {}, EVIDENCE)
 
     assert len(calls) == 1
+
+
+def test_unsupported_operational_safety_claim_is_rejected(monkeypatch):
+    result = valid_result()
+    result["observations"][0]["text"] = "The pump is safe to operate."
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        return FakeResponse(json.dumps(result))
+
+    monkeypatch.setattr(ai_service, "urlopen", fake_urlopen)
+
+    with pytest.raises(
+        ai_service.AIServiceError,
+        match="unsupported equipment-operation safety claim",
+    ):
+        ai_service.analyze_issue({}, {}, EVIDENCE)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "The pump can continue normal operation.",
+        "Operation of the pump may continue.",
+        "The pump may be operated normally.",
+    ],
+)
+def test_implied_operational_clearance_is_rejected(claim):
+    result = valid_result()
+    result["observations"][0]["text"] = claim
+
+    with pytest.raises(
+        ai_service.AIServiceError,
+        match="unsupported equipment-operation safety claim",
+    ):
+        ai_service._validate_result(result, {CITATION})
+
+
+def test_operational_context_without_clearance_is_accepted():
+    result = valid_result()
+    result["observations"][0]["text"] = (
+        "Vibration was observed during normal operation."
+    )
+
+    assert ai_service._validate_result(result, {CITATION}) == result
 
 
 def test_invalid_field_type_is_reported_after_one_retry(monkeypatch):

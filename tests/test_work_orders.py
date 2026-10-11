@@ -2,8 +2,10 @@ import importlib
 
 import pytest
 
+from src import ai_service
 import src.database as database
-from src.work_order_drafts import draft_from_analysis
+from src.rules import evaluate_sensor_readings
+from src.work_order_drafts import draft_from_analysis, draft_from_issue
 
 
 def setup_db(monkeypatch, tmp_path):
@@ -44,6 +46,28 @@ def test_issue_history_persists(monkeypatch, tmp_path):
     assert [item["description"] for item in history] == ["Second issue", "First issue"]
 
 
+def test_saved_issue_can_be_loaded_with_sensor_data_and_equipment_type(
+    monkeypatch,
+    tmp_path,
+):
+    db = setup_db(monkeypatch, tmp_path)
+    db.register_equipment("CP-101", "Centrifugal Pump")
+    issue_id = db.create_issue(
+        "CP-101",
+        "Unusual vibration",
+        operating_events=["Observed after startup"],
+        sensor_readings={"vibration_mm_s": 5.2},
+    )
+
+    issue = db.get_issue(issue_id)
+
+    assert issue is not None
+    assert issue["equipment_type"] == "Centrifugal Pump"
+    assert issue["description"] == "Unusual vibration"
+    assert issue["operating_events"] == ["Observed after startup"]
+    assert issue["sensor_readings"] == {"vibration_mm_s": 5.2}
+
+
 def test_new_work_order_starts_as_draft(monkeypatch, tmp_path):
     db = setup_db(monkeypatch, tmp_path)
     db.register_equipment("CP-101", "Centrifugal Pump")
@@ -59,6 +83,66 @@ def test_new_work_order_starts_as_draft(monkeypatch, tmp_path):
     assert orders[0]["work_order_id"] == work_order_id
     assert orders[0]["status"] == "draft"
     assert orders[0]["draft"]["actions"] == ["Check bolts"]
+
+
+def test_create_work_order_once_is_persistent_idempotent_and_reviewable(
+    monkeypatch,
+    tmp_path,
+):
+    db = setup_db(monkeypatch, tmp_path)
+    db.register_equipment("CP-101", "Centrifugal Pump")
+    issue_id = db.create_issue("CP-101", "Unusual vibration")
+    draft = draft_from_issue(db.get_issue(issue_id))
+
+    work_order_id, created = db.create_work_order_once(issue_id, draft)
+    repeated_id, repeated_created = db.create_work_order_once(issue_id, draft)
+
+    assert created is True
+    assert repeated_created is False
+    assert repeated_id == work_order_id
+    assert len(db.get_work_orders(issue_id)) == 1
+
+    reloaded = setup_db(monkeypatch, tmp_path)
+    order = reloaded.get_work_orders(issue_id)[0]
+    assert order["work_order_id"] == work_order_id
+    assert order["issue_id"] == issue_id
+    assert order["status"] == "draft"
+    assert order["reviewed_by"] is None
+    assert order["draft"]["priority"] == "requires_review"
+
+    reloaded.review_work_order(work_order_id, "approved", "Technician A")
+    approved_order = reloaded.get_work_orders(issue_id)[0]
+    assert approved_order["status"] == "approved"
+    assert approved_order["reviewed_by"] == "Technician A"
+
+
+def test_work_order_read_deduplicates_repeated_but_preserves_distinct_actions(
+    monkeypatch,
+    tmp_path,
+):
+    db = setup_db(monkeypatch, tmp_path)
+    db.register_equipment("CP-101", "Centrifugal Pump")
+    issue_id = db.create_issue("CP-101", "Unusual vibration")
+    work_order_id = db.create_work_order(
+        issue_id,
+        {
+            "summary": "Review issue",
+            "priority": "requires_review",
+            "actions": [
+                "Review the cited manual passage.",
+                "Inspect the mounting bolts.",
+                "Review the cited manual passage.",
+            ],
+        },
+    )
+
+    order = db.get_work_orders(issue_id)[0]
+
+    assert order["work_order_id"] == work_order_id
+    assert order["draft"]["actions"] == [
+        "Review the cited manual passage.",
+        "Inspect the mounting bolts.",
+    ]
 
 
 def test_technician_can_approve_and_reject_drafts(monkeypatch, tmp_path):
@@ -240,6 +324,36 @@ def test_analysis_work_order_is_linked_to_issue_and_starts_as_draft(
     }
 
 
+def test_demo_guidance_can_only_create_a_pending_review_work_order(
+    monkeypatch,
+    tmp_path,
+):
+    db = setup_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(ai_service, "AI_PROVIDER", "demo")
+    db.register_equipment("CP-101", "Centrifugal Pump")
+    issue_id = db.create_issue("CP-101", "Unusual vibration")
+
+    analysis = ai_service.analyze_issue(
+        {"description": "Unusual vibration"},
+        evaluate_sensor_readings({}),
+        [],
+    )
+    assert analysis["ai_provider"] == "demo"
+    assert analysis["ai_generated"] is False
+    assert analysis["review_status"] == "draft"
+
+    work_order_id, created = db.create_analysis_work_order_once(
+        issue_id,
+        draft_from_analysis(analysis),
+    )
+
+    order = db.get_work_orders(issue_id)[0]
+    assert created is True
+    assert order["work_order_id"] == work_order_id
+    assert order["status"] == "draft"
+    assert order["reviewed_by"] is None
+
+
 def test_repeated_analysis_work_order_creation_does_not_duplicate(
     monkeypatch,
     tmp_path,
@@ -326,3 +440,34 @@ def test_analysis_draft_uses_inspection_action_and_analysis_priority():
 
     assert draft["priority"] == "medium"
     assert draft["actions"] == ["Check alignment."]
+
+
+def test_deterministic_demo_guidance_can_create_technician_review_draft():
+    draft = draft_from_analysis({
+        "ai_provider": "demo",
+        "ai_generated": False,
+        "proposed_priority": "requires_review",
+        "draft_work_order": {
+            "summary": "Technician review of reported equipment issue",
+            "priority": "requires_review",
+            "actions": ["Review cited manual passage."],
+            "evidence_citations": ["manual.md | Section A | lines 1-2"],
+        },
+    })
+
+    assert draft["priority"] == "requires_review"
+    assert draft["actions"] == ["Review cited manual passage."]
+    assert draft["evidence_citations"] == ["manual.md | Section A | lines 1-2"]
+
+
+def test_unlabelled_non_ai_guidance_cannot_create_work_order_draft():
+    with pytest.raises(ValueError, match="validated AI analysis"):
+        draft_from_analysis({
+            "ai_generated": False,
+            "draft_work_order": {
+                "summary": "Unverified",
+                "priority": "requires_review",
+                "actions": ["Inspect."],
+                "evidence_citations": [],
+            },
+        })

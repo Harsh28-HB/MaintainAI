@@ -15,6 +15,11 @@ MaintainAI is intended to help maintenance teams do the following:
 
 The application and bundled manual are demonstration materials. The manual is not manufacturer-verified, sensor thresholds are illustrative, and AI-generated guidance is advisory. A qualified technician must verify evidence and approve any work order; the application does not control equipment.
 
+The persisted `draft` work-order state is shown in the interface as **Pending
+Review**. Approval applies only to the documented maintenance work and never
+establishes that equipment is safe or authorizes equipment operation.
+Operational safety is not established by this application.
+
 ## Key features
 
 - equipment registration and issue capture
@@ -115,7 +120,7 @@ OLLAMA_MODEL=qwen2.5:3b
 - Keep local environment variables in a project-local `.env` file.
 - Do not commit secrets or personal credentials into source control.
 - The repository includes `.env.example` as a template.
-- The AI service supports `AI_PROVIDER=ollama` (default), `AI_PROVIDER=openai`, or `AI_PROVIDER=openai_compatible`. For the latter two, provide `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `OPENAI_BASE_URL`.
+- The analysis service supports `AI_PROVIDER=ollama` (default), `AI_PROVIDER=demo`, `AI_PROVIDER=openai`, or `AI_PROVIDER=openai_compatible`. Hosted model providers require `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `OPENAI_BASE_URL`.
 - Persist the SQLite database by setting `MAINTAINAI_DB_PATH`, or by mounting a writable volume to the selected host runtime.
 - The app will still allow the user to view saved reports when AI analysis is unavailable; it does not auto-approve work orders.
 - The bundled `.env.example` binds Streamlit to loopback. Do not bind to a public interface without adding authentication, access controls, and a secure deployment configuration.
@@ -130,11 +135,24 @@ OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:3b
 ```
 
-Ollama running on your development computer is not reachable from a Community
-Cloud app through `localhost`. Select a hosted provider for deployment. To use
-OpenAI, add these values in the app's **Settings > Secrets** page in Streamlit
-Community Cloud. Replace the model and placeholder with values for your
-account; do not add a real key to this repository:
+For a keyless Streamlit Community Cloud demo, set the app's **Settings >
+Secrets** to:
+
+```toml
+AI_PROVIDER = "demo"
+```
+
+Demo mode makes no external AI requests and requires no API credentials. It
+uses deterministic sensor rules and any retrieved manual passages to produce
+clearly labelled technician-review guidance; it does not generate or infer
+failure causes. If retrieval finds no manual evidence, the guidance explicitly
+states that it has no manual support and includes no citations. The UI displays:
+
+> Demo Mode: deterministic guidance only. No generative AI is used.
+
+For genuine hosted model analysis, configure OpenAI in Streamlit secrets.
+Replace the placeholder values with credentials and a model available to your
+account; never commit a real key:
 
 ```toml
 AI_PROVIDER = "openai"
@@ -142,8 +160,8 @@ OPENAI_API_KEY = "replace-with-your-provider-key"
 OPENAI_MODEL = "gpt-4o-mini"
 ```
 
-`OPENAI_BASE_URL` is optional for OpenAI. For an OpenAI-compatible service with
-a different endpoint, configure all four values in Streamlit secrets:
+`OPENAI_BASE_URL` is optional for OpenAI. An OpenAI-compatible service may be
+configured explicitly with:
 
 ```toml
 AI_PROVIDER = "openai_compatible"
@@ -153,8 +171,35 @@ OPENAI_BASE_URL = "https://your-provider.example/v1"
 ```
 
 The application reads configuration from environment variables first and
-Streamlit secrets second. Local `.env` configuration continues to work, and
-Ollama remains the default when `AI_PROVIDER` is not set.
+Streamlit secrets second. Local `.env` configuration continues to work.
+`AI_PROVIDER=ollama` remains the local default when the provider is unset.
+Ollama running on your development computer is not reachable by a Community
+Cloud app through `localhost`. A process environment setting takes precedence
+over Streamlit secrets, so remove any deployment environment setting that
+conflicts with the selected provider.
+
+For local development, set the provider explicitly in `.env`:
+
+```env
+AI_PROVIDER=openai
+OPENAI_API_KEY=your-provider-key
+OPENAI_MODEL=gpt-4o-mini
+```
+
+To use local Ollama instead:
+
+```env
+AI_PROVIDER=ollama
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:3b
+```
+
+Because provider settings are loaded when the AI service module is imported,
+stop and restart the Streamlit server after editing `.env` or changing secrets.
+An `AI_PROVIDER=ollama` environment value takes precedence over an
+`AI_PROVIDER="openai"` Streamlit secret; change or remove the environment value
+to select OpenAI. The AI service logs the selected provider name only and never
+logs the API key.
 
 Deployment steps:
 
@@ -162,10 +207,12 @@ Deployment steps:
    and `data/manuals/`.
 2. In Streamlit Community Cloud, create an app for `Harsh28-HB/MaintainAI`
    and set the entry point to `app.py`.
-3. Add the provider values above in **Settings > Secrets**. Keep the API key
-   only in the secrets editor; never commit `.streamlit/secrets.toml`.
-4. Restart/redeploy after changing secrets, then test issue analysis with the
-   configured hosted provider.
+3. Add `AI_PROVIDER = "demo"` in **Settings > Secrets** for the no-key demo,
+   or configure the OpenAI secrets above for genuine hosted inference.
+4. Restart/redeploy after changing secrets, then submit an issue to verify
+   analysis behavior. Demo mode should show its deterministic-guidance notice.
+   Keep any provider key only in the secrets editor; never commit
+   `.streamlit/secrets.toml`.
 
 The configured OpenAI-compatible service must support chat completions and
 JSON-object response formatting. MaintainAI validates the returned schema and
@@ -263,8 +310,16 @@ Audit events include issue creation, work-order drafting, draft edits, approval 
 The application supports this workflow:
 
 - a draft work order is created for an issue
+- from Work Orders, use **Create Work Order Draft** when a saved issue does
+  not yet have a work order; the draft is persisted against that issue and
+  appears in the same view immediately
+- repeated creation requests for the same issue return its existing order
+  rather than creating a duplicate
 - a technician can review the draft and record an explicit decision
 - valid decisions are `approved` or `rejected`
+- the interface labels a stored `draft` as **Pending Review**
+- an approved order is labelled **Approved for maintenance work**; this is not
+  permission to operate equipment
 - once a work order is approved or rejected, it cannot be reviewed again
 - only draft work orders may be edited
 - all decisions are persisted in the database and recorded in `audit_events`
@@ -299,12 +354,21 @@ It flags:
 
 Important: the threshold values used by the project are demo values for the application workflow and are not verified equipment safety limits. They are illustrative only and must not be treated as a real manufacturer or engineering specification.
 
+Missing, invalid, and conflicting measurements are listed individually in
+Analysis Results. Obtain and verify those readings and have a qualified
+technician review the issue. The application reports **Operational safety not
+established** because it has no applicable, verified equipment-specific
+operating rule; neither generated guidance nor work-order approval changes
+that status.
+
 ## Known limitations
 
 - The app is designed for local demonstration and maintenance coordination, not remote equipment control.
-- The AI workflow requires either a local Ollama service or a reachable hosted
-  provider configured with valid credentials.
+- The analysis workflow requires deterministic `demo` mode, a reachable local
+  Ollama service, or a reachable hosted provider configured with valid
+  credentials.
 - The AI output is advisory and always requires technician review and approval.
+- Neither analysis guidance nor an approved work order is equipment-operation authorization.
 - There is no production-grade hosted deployment in this repository. Any hosted deployment would require a reachable inference service, secure configuration, and production hardening.
 - The app intentionally does not auto-approve or auto-execute maintenance actions.
 
